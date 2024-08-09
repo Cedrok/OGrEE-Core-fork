@@ -457,7 +457,6 @@ func HandleGenericObjects(w http.ResponseWriter, r *http.Request) {
 	fmt.Println("FUNCTION CALL: 	 HandleGenericObjects ")
 	fmt.Println(u.AsteriskLine)
 	DispRequestMetaData(r)
-	matchingObjects := []map[string]interface{}{}
 
 	// Get user roles for permissions
 	user := getUserFromToken(w, r)
@@ -466,35 +465,9 @@ func HandleGenericObjects(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get objects
-	filters := getFiltersFromQueryParams(r)
-	req := u.FilteredReqFromQueryParams(r.URL)
-	entities := u.GetEntitiesById(filters.Namespace, filters.Id)
-
-	for _, entStr := range entities {
-		// Get objects
-		entData, err := models.GetManyObjects(entStr, req, filters, "", user.Roles)
-		if err != nil {
-			u.ErrLog("Error while looking for objects at  "+entStr, "HandleGenericObjects", err.Message, r)
-			u.RespondWithError(w, err)
-			return
-		}
-
-		// Save entity to help delete and respond
-		for _, obj := range entData {
-			obj["entity"] = entStr
-		}
-
-		if nLimit, e := strconv.Atoi(filters.Limit); e == nil && nLimit > 0 && req["id"] != nil {
-			// Get children until limit level (only for GET)
-			for _, obj := range entData {
-				obj["children"], err = models.GetHierarchyByName(entStr, obj["id"].(string), nLimit, filters)
-				if err != nil {
-					u.ErrLog("Error while getting "+entStr, "GET "+entStr, err.Message, r)
-					u.RespondWithError(w, err)
-				}
-			}
-		}
-		matchingObjects = append(matchingObjects, entData...)
+	matchingObjects, ok := getGenericObjects(w, r, user, "", "HandleGenericObjects")
+	if !ok {
+		return
 	}
 
 	// Respond
@@ -520,7 +493,7 @@ func HandleGenericObjects(w http.ResponseWriter, r *http.Request) {
 		}
 		u.Respond(w, u.RespDataWrapper("successfully deleted objects", matchingObjects))
 	} else if r.Method == "OPTIONS" {
-		u.WriteOptionsHeader(w, "GET")
+		u.WriteOptionsHeader(w, "GET, DELETE")
 	} else {
 		matchingObjects = pie.Map(matchingObjects, func(object map[string]any) map[string]any {
 			entityStr := object["entity"].(string)
@@ -530,6 +503,57 @@ func HandleGenericObjects(w http.ResponseWriter, r *http.Request) {
 		})
 		u.Respond(w, u.RespDataWrapper("successfully processed request", matchingObjects))
 	}
+}
+
+func getGenericObjects(w http.ResponseWriter, r *http.Request, user *models.Account, complexFilterExp, funcName string) ([]map[string]interface{}, bool) {
+	matchingObjects := []map[string]interface{}{}
+
+	filters := getFiltersFromQueryParams(r)
+	req := u.FilteredReqFromQueryParams(r.URL)
+	entities := u.GetEntitiesById(filters.Namespace, filters.Id)
+
+	for _, entStr := range entities {
+		// Get objects
+		entData, err := models.GetManyObjects(entStr, req, filters, complexFilterExp, user.Roles)
+		if err != nil {
+			u.ErrLog("Error while looking for objects at  "+entStr, funcName, err.Message, r)
+			u.RespondWithError(w, err)
+			return nil, false
+		}
+
+		// Save entity to help delete and respond
+		for _, obj := range entData {
+			obj["entity"] = entStr
+			if entStr == "device" && strings.Contains(complexFilterExp, "virtual_config.type=node") {
+				// add namespace prefix to device nodes
+				obj["id"] = "Physical." + obj["id"].(string)
+			}
+		}
+
+		ok, err := checkChildrenLimit(entData, entStr, filters, req)
+		if !ok {
+			u.ErrLog("Error while getting "+entStr, "GET "+entStr, err.Message, r)
+			u.RespondWithError(w, err)
+		}
+
+		matchingObjects = append(matchingObjects, entData...)
+	}
+
+	return matchingObjects, true
+}
+
+func checkChildrenLimit(entData []map[string]interface{}, entStr string, filters u.RequestFilters, req primitive.M) (bool, *u.Error) {
+	if nLimit, e := strconv.Atoi(filters.Limit); e == nil && nLimit > 0 && req["id"] != nil {
+		// Get children until limit level (only for GET)
+		for _, obj := range entData {
+			var err *u.Error
+			obj["children"], err = models.GetHierarchyByName(entStr, obj["id"].(string), nLimit, filters)
+			if err != nil {
+				return false, err
+			}
+		}
+	}
+	return true, nil
 }
 
 // swagger:operation POST /api/objects/search Objects HandleComplexFilters
@@ -652,7 +676,6 @@ func HandleComplexFilters(w http.ResponseWriter, r *http.Request) {
 	var complexFilters map[string]interface{}
 	var complexFilterExp string
 	var ok bool
-	matchingObjects := []map[string]interface{}{}
 
 	// Get user roles for permissions
 	user := getUserFromToken(w, r)
@@ -673,29 +696,9 @@ func HandleComplexFilters(w http.ResponseWriter, r *http.Request) {
 	println(complexFilterExp)
 
 	// Get objects
-	filters := getFiltersFromQueryParams(r)
-	req := u.FilteredReqFromQueryParams(r.URL)
-	entities := u.GetEntitiesById(filters.Namespace, filters.Id)
-
-	for _, entStr := range entities {
-		// Get objects
-		entData, err := models.GetManyObjects(entStr, req, filters, complexFilterExp, user.Roles)
-		if err != nil {
-			u.ErrLog("Error while looking for objects at "+entStr, "HandleComplexFilters", err.Message, r)
-			u.RespondWithError(w, err)
-			return
-		}
-
-		// Save entity to help delete and respond
-		for _, obj := range entData {
-			obj["entity"] = entStr
-			if entStr == "device" && strings.Contains(complexFilterExp, "virtual_config.type=node") {
-				// add namespace prefix to device nodes
-				obj["id"] = "Physical." + obj["id"].(string)
-			}
-		}
-
-		matchingObjects = append(matchingObjects, entData...)
+	matchingObjects, ok := getGenericObjects(w, r, user, complexFilterExp, "HandleComplexFilters")
+	if !ok {
+		return
 	}
 
 	if r.Method == "DELETE" {
@@ -719,7 +722,7 @@ func HandleComplexFilters(w http.ResponseWriter, r *http.Request) {
 		}
 		u.Respond(w, u.RespDataWrapper("successfully deleted objects", matchingObjects))
 	} else if r.Method == "OPTIONS" {
-		u.WriteOptionsHeader(w, "POST")
+		u.WriteOptionsHeader(w, "POST, DELETE")
 	} else {
 		u.Respond(w, u.RespDataWrapper("successfully processed request", matchingObjects))
 	}
